@@ -31,18 +31,17 @@ export default async function handler(req, res) {
     let products = [];
 
     if (shopDomain && sfToken) {
-      // einfache Keyword-Extraktion aus der Nutzerfrage
+      // --- Keywords extrahieren ---
       const words = message.toLowerCase()
         .replace(/[^\p{L}\p{N}\s]/gu, " ")
         .split(/\s+/)
-        .filter(w => w.length >= 3 && !["und","oder","mit","für","als","ein","eine","der","die","das","den","des"].includes(w));
+        .filter(w =>
+          w.length >= 3 &&
+          !["und","oder","mit","für","als","ein","eine","der","die","das","den","des"].includes(w)
+        );
       const uniq = [...new Set(words)].slice(0, 6);
 
-      // Shopify Query-Syntax: wir suchen in Titel, Tags, Produkttyp
-      const queryExpr = uniq.length
-        ? uniq.map(w => `(title:*${w}* OR tag:'${w}' OR product_type:'${w}')`).join(" AND ")
-        : "available_for_sale:true";
-
+      // --- GraphQL Query (wird für beide Suchen genutzt) ---
       const gql = `
         query Search($query: String!) {
           products(first: 8, query: $query) {
@@ -72,38 +71,62 @@ export default async function handler(req, res) {
         }
       `;
 
-      const r = await fetch(`https://${shopDomain}/api/2024-07/graphql.json`, {
+      // --- 1) Einfache Volltextsuche: Wörter mit Leerzeichen ---
+      let queryExpr = uniq.length ? uniq.join(" ") : "available_for_sale:true";
+
+      const endpoint = `https://${shopDomain}/api/2024-07/graphql.json`;
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Storefront-Access-Token": sfToken,
+      };
+
+      let r = await fetch(endpoint, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Storefront-Access-Token": sfToken,
-        },
+        headers,
         body: JSON.stringify({ query: gql, variables: { query: queryExpr } })
       });
 
-      if (!r.ok) {
-        const t = await r.text().catch(() => "");
-        console.error("Shopify Storefront error", r.status, t);
-      } else {
-        const j = await r.json();
-        const domainForLinks = shopDomain.replace(".myshopify.com", "");
-        products = (j.data?.products?.edges || []).map(e => {
-          const n = e.node;
-          const v = n.variants?.edges?.[0]?.node;
-          return {
-            title: n.title,
-            handle: n.handle,
-            url: n.onlineStoreUrl || `https://${domainForLinks}.store/products/${n.handle}`,
-            productType: n.productType,
-            tags: n.tags,
-            desc: n.description || "",
-            image: n.featuredImage?.url || "",
-            available: (v?.availableForSale ?? n.availableForSale) ?? true,
-            qty: (typeof v?.quantityAvailable === "number") ? v.quantityAvailable : null,
-            price: v?.price?.amount ? `${v.price.amount} ${v.price.currencyCode}` : null
-          };
+      let j = null;
+      if (r.ok) j = await r.json();
+      let edges = j?.data?.products?.edges || [];
+
+      // --- 2) Fallback: Feld-OR mit exakten Begriffen ---
+      if (!edges.length && uniq.length) {
+        const fieldOr = uniq
+          .map(w => `(title:'${w}' OR tag:'${w}' OR product_type:'${w}')`)
+          .join(" OR ");
+        queryExpr = fieldOr;
+
+        r = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ query: gql, variables: { query: queryExpr } })
         });
+        if (r.ok) {
+          j = await r.json();
+          edges = j?.data?.products?.edges || [];
+        }
       }
+
+      // --- Mapping der Produkte ---
+      const domainForLinks = shopDomain.replace(".myshopify.com", "");
+      products = edges.map(e => {
+        const n = e.node;
+        const v = n.variants?.edges?.[0]?.node;
+        return {
+          title: n.title,
+          handle: n.handle,
+          url: n.onlineStoreUrl || `https://${domainForLinks}.store/products/${n.handle}`,
+          productType: n.productType,
+          tags: n.tags,
+          desc: n.description || "",
+          image: n.featuredImage?.url || "",
+          // Verfügbarkeit möglichst treffsicher:
+          available: (v?.availableForSale ?? n.availableForSale) ?? true,
+          qty: (typeof v?.quantityAvailable === "number") ? v.quantityAvailable : null,
+          price: v?.price?.amount ? `${v.price.amount} ${v.price.currencyCode}` : null
+        };
+      });
     }
 
     // ===== 2) GPT-Antwort mit Katalog-Kontext =====
