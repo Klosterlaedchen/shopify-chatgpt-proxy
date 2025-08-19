@@ -1,4 +1,6 @@
-// ChatGPT-Produktberater: Shopify-Produktsuche (Storefront API) + GPT-Antwort
+// ChatGPT-Produktberater – Variante B:
+// Hole bis zu 50 Produkte (ohne Query) aus Shopify und lass GPT filtern & empfehlen.
+
 export default async function handler(req, res) {
   // ===== CORS (mehrere erlaubte Origins) =====
   const originHeader = req.headers.origin || "";
@@ -25,26 +27,16 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Missing 'message' (string) in body." });
     }
 
-    // ===== 1) Shopify Produktsuche (Storefront API) =====
+    // ===== 1) Bis zu 50 Produkte aus Shopify holen (ohne Such-Query) =====
     const shopDomain = process.env.SHOPIFY_DOMAIN;            // z.B. dianas-klosterlaedchen.myshopify.com
     const sfToken     = process.env.SHOPIFY_STOREFRONT_TOKEN;  // Storefront-Access-Token
     let products = [];
 
     if (shopDomain && sfToken) {
-      // --- Keywords extrahieren ---
-      const words = message.toLowerCase()
-        .replace(/[^\p{L}\p{N}\s]/gu, " ")
-        .split(/\s+/)
-        .filter(w =>
-          w.length >= 3 &&
-          !["und","oder","mit","für","als","ein","eine","der","die","das","den","des"].includes(w)
-        );
-      const uniq = [...new Set(words)].slice(0, 6);
-
-      // --- GraphQL Query (wird für beide Suchen genutzt) ---
+      // GraphQL: hole die ersten 50 Produkte (Standard-Sortierung im Shop)
       const gql = `
-        query Search($query: String!) {
-          products(first: 8, query: $query) {
+        query GetProducts {
+          products(first: 50) {
             edges {
               node {
                 id
@@ -52,7 +44,7 @@ export default async function handler(req, res) {
                 handle
                 productType
                 tags
-                description(truncateAt: 140)
+                description(truncateAt: 240)
                 featuredImage { url altText }
                 availableForSale
                 variants(first: 1) {
@@ -71,75 +63,75 @@ export default async function handler(req, res) {
         }
       `;
 
-      // --- 1) Einfache Volltextsuche: Wörter mit Leerzeichen ---
-      let queryExpr = uniq.length ? uniq.join(" ") : "available_for_sale:true";
-
-      const endpoint = `https://${shopDomain}/api/2024-07/graphql.json`;
-      const headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Storefront-Access-Token": sfToken,
-      };
-
-      let r = await fetch(endpoint, {
+      const r = await fetch(`https://${shopDomain}/api/2024-07/graphql.json`, {
         method: "POST",
-        headers,
-        body: JSON.stringify({ query: gql, variables: { query: queryExpr } })
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Storefront-Access-Token": sfToken,
+        },
+        body: JSON.stringify({ query: gql })
       });
 
-      let j = null;
-      if (r.ok) j = await r.json();
-      let edges = j?.data?.products?.edges || [];
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        console.error("Shopify Storefront error", r.status, t);
+      } else {
+        const j = await r.json();
 
-      // --- 2) Fallback: Feld-OR mit exakten Begriffen ---
-      if (!edges.length && uniq.length) {
-        const fieldOr = uniq
-          .map(w => `(title:'${w}' OR tag:'${w}' OR product_type:'${w}')`)
-          .join(" OR ");
-        queryExpr = fieldOr;
+        // Basis-URL für Produktlinks ermitteln:
+        // 1) explizit per FRONTEND_BASE_URL (optional)
+        // 2) sonst aus ALLOWED_ORIGINS die .store-Domain oder die erste Domain
+        // 3) Fallback: myshopify.com-Domain
+        const frontendBase =
+          (process.env.FRONTEND_BASE_URL || "").replace(/\/$/, "") ||
+          allowList.find(o => /\.store/.test(o)) ||
+          allowList[0] ||
+          `https://${shopDomain}`;
 
-        r = await fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ query: gql, variables: { query: queryExpr } })
+        const edges = j?.data?.products?.edges || [];
+        products = edges.map(e => {
+          const n = e.node;
+          const v = n.variants?.edges?.[0]?.node;
+          const urlCandidate = (n.onlineStoreUrl || `${frontendBase.replace(/\/$/, "")}/products/${n.handle}`);
+          return {
+            title: n.title,
+            handle: n.handle,
+            url: urlCandidate,
+            productType: n.productType,
+            tags: n.tags,
+            desc: n.description || "",
+            image: n.featuredImage?.url || "",
+            // Verfügbarkeit/Bestand:
+            available: (v?.availableForSale ?? n.availableForSale) ?? true,
+            qty: (typeof v?.quantityAvailable === "number") ? v.quantityAvailable : null,
+            price: v?.price?.amount ? `${v.price.amount} ${v.price.currencyCode}` : null
+          };
         });
-        if (r.ok) {
-          j = await r.json();
-          edges = j?.data?.products?.edges || [];
-        }
       }
-
-      // --- Mapping der Produkte ---
-      const domainForLinks = shopDomain.replace(".myshopify.com", "");
-      products = edges.map(e => {
-        const n = e.node;
-        const v = n.variants?.edges?.[0]?.node;
-        return {
-          title: n.title,
-          handle: n.handle,
-          url: n.onlineStoreUrl || `https://${domainForLinks}.store/products/${n.handle}`,
-          productType: n.productType,
-          tags: n.tags,
-          desc: n.description || "",
-          image: n.featuredImage?.url || "",
-          // Verfügbarkeit möglichst treffsicher:
-          available: (v?.availableForSale ?? n.availableForSale) ?? true,
-          qty: (typeof v?.quantityAvailable === "number") ? v.quantityAvailable : null,
-          price: v?.price?.amount ? `${v.price.amount} ${v.price.currencyCode}` : null
-        };
-      });
     }
 
-    // ===== 2) GPT-Antwort mit Katalog-Kontext =====
+    // ===== 2) GPT-Antwort: Produkte filtern + empfehlen =====
     const systemPrompt = [
       "Du bist ein Produktberater für einen Shopify-Shop. Antworte kurz, klar und freundlich.",
-      "Nutze NUR die bereitgestellten Produkte (JSON) für Empfehlungen; erfinde nichts.",
-      "Wenn die Liste leer ist, stelle genau 1 kurze Rückfrage zur Präzisierung.",
-      "Gib je Empfehlung: Titel, 1 Satz Nutzen, Preis (falls vorhanden) und Link.",
+      "Du erhältst eine Liste von Shop-Produkten als JSON. Wähle 3–5 passende Empfehlungen aus.",
+      "Wähle nur Artikel, die thematisch zur Nutzerfrage passen.",
       "Verfügbarkeit: '✅ Auf Lager' (qty>5 oder available true), '⚠️ Begrenzt' (1–5), '❌ Nicht verfügbar' (0/false).",
+      "Gib je Empfehlung: Titel, 1 Satz Nutzen, Preis (falls vorhanden) und klickbaren Link.",
+      "Wenn keine Produkttreffer sinnvoll sind, stelle genau 1 kurze Rückfrage zur Präzisierung."
     ].join(" ");
 
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    const catalogSnippet = JSON.stringify(products.slice(0, 8));
+    // Trimme Felder minimal, damit der Kontext kompakt bleibt:
+    const compact = products.slice(0, 50).map(p => ({
+      title: p.title,
+      desc: p.desc,
+      tags: p.tags,
+      productType: p.productType,
+      url: p.url,
+      available: p.available,
+      qty: p.qty,
+      price: p.price
+    }));
 
     const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -152,7 +144,7 @@ export default async function handler(req, res) {
         temperature: 0.4,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: `Nutzerfrage: ${message}\nKontext: ${JSON.stringify(context || {})}\nKatalog(JSON): ${catalogSnippet}` }
+          { role: "user", content: `Nutzerfrage: ${message}\nKontext: ${JSON.stringify(context || {})}\nProdukte(JSON, max 50): ${JSON.stringify(compact)}` }
         ]
       })
     });
