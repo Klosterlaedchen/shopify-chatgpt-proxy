@@ -1,13 +1,31 @@
 // Serverless-Funktion für Vercel: Schutz des OpenAI-Keys + CORS
 export default async function handler(req, res) {
-  // ----- CORS -----
-  const allowed = process.env.ALLOWED_ORIGIN || "*"; // im Live-Betrieb bitte Domain setzen!
-  res.setHeader("Access-Control-Allow-Origin", allowed);
+  // ----- CORS (mehrere erlaubte Origins) -----
+  const originHeader = req.headers.origin || "";
+  const allowList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  let allowOrigin = "*";
+  if (allowList.includes("*")) {
+    allowOrigin = "*";
+  } else if (allowList.includes(originHeader)) {
+    allowOrigin = originHeader;
+  } else if (allowList.length) {
+    // fallback: erste erlaubte Domain
+    allowOrigin = allowList[0];
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
@@ -30,27 +48,27 @@ export default async function handler(req, res) {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         model,
-        temperature: 0.4,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: JSON.stringify({ message, context: context || null }) }
-        ]
-      })
+          { role: "user", content: message }
+        ],
+      }),
     });
 
     if (!r.ok) {
-      const errText = await r.text().catch(() => "");
-      return res.status(r.status).json({ error: "OpenAI error", detail: errText });
+      const errorText = await r.text();
+      return res.status(r.status).json({ error: "OpenAI API error", details: errorText });
     }
 
     const data = await r.json();
-    const text = data?.choices?.[0]?.message?.content ?? "";
-    return res.status(200).json({ ok: true, text });
-  } catch (e) {
-    return res.status(500).json({ error: "Proxy error", detail: String(e?.message || e) });
+    const reply = data.choices?.[0]?.message?.content?.trim() || "Entschuldigung, keine Antwort erhalten.";
+
+    res.status(200).json({ reply });
+  } catch (err) {
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 }
