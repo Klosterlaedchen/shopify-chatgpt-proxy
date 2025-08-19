@@ -1,6 +1,6 @@
 // ChatGPT-Produktberater: Shopify-Produktsuche (Storefront API) + GPT-Antwort
 export default async function handler(req, res) {
-  // ===== CORS (mehrere erlaubte Origins unterstützt) =====
+  // ===== CORS (mehrere erlaubte Origins) =====
   const originHeader = req.headers.origin || "";
   const allowList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -15,28 +15,30 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method Not Allowed" });
 
   try {
+    // ===== Request-Body prüfen =====
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const { message, context } = body;
     if (!message || typeof message !== "string") {
-      return res.status(400).json({ ok:false, error:"Missing 'message' (string) in body." });
+      return res.status(400).json({ ok: false, error: "Missing 'message' (string) in body." });
     }
 
-    // ===== 1) Shopify Produktsuche über Storefront API =====
-    const shopDomain = process.env.SHOPIFY_DOMAIN;                 // z.B. dianas-klosterlaedchen.myshopify.com
-    const sfToken    = process.env.SHOPIFY_STOREFRONT_TOKEN;       // in Shopify erzeugt
+    // ===== 1) Shopify Produktsuche (Storefront API) =====
+    const shopDomain = process.env.SHOPIFY_DOMAIN;            // z.B. dianas-klosterlaedchen.myshopify.com
+    const sfToken     = process.env.SHOPIFY_STOREFRONT_TOKEN;  // Storefront-Access-Token
     let products = [];
 
     if (shopDomain && sfToken) {
-      // simple Keyword-Aufbereitung
+      // einfache Keyword-Extraktion aus der Nutzerfrage
       const words = message.toLowerCase()
         .replace(/[^\p{L}\p{N}\s]/gu, " ")
         .split(/\s+/)
-        .filter(w => w.length >= 3 && !["und","oder","mit","für","als","ein","eine","der","die","das"].includes(w));
+        .filter(w => w.length >= 3 && !["und","oder","mit","für","als","ein","eine","der","die","das","den","des"].includes(w));
       const uniq = [...new Set(words)].slice(0, 6);
 
+      // Shopify Query-Syntax: wir suchen in Titel, Tags, Produkttyp
       const queryExpr = uniq.length
         ? uniq.map(w => `(title:*${w}* OR tag:'${w}' OR product_type:'${w}')`).join(" AND ")
         : "available_for_sale:true";
@@ -53,6 +55,7 @@ export default async function handler(req, res) {
                 tags
                 description(truncateAt: 140)
                 featuredImage { url altText }
+                availableForSale
                 variants(first: 1) {
                   edges {
                     node {
@@ -62,6 +65,7 @@ export default async function handler(req, res) {
                     }
                   }
                 }
+                onlineStoreUrl
               }
             }
           }
@@ -78,23 +82,23 @@ export default async function handler(req, res) {
       });
 
       if (!r.ok) {
-        const t = await r.text().catch(()=> "");
-        // wir brechen nicht ab – GPT kann notfalls ohne Katalog antworten
+        const t = await r.text().catch(() => "");
         console.error("Shopify Storefront error", r.status, t);
       } else {
         const j = await r.json();
+        const domainForLinks = shopDomain.replace(".myshopify.com", "");
         products = (j.data?.products?.edges || []).map(e => {
-          const v = e.node.variants?.edges?.[0]?.node;
-          const domainForLinks = shopDomain.replace(".myshopify.com","");
+          const n = e.node;
+          const v = n.variants?.edges?.[0]?.node;
           return {
-            title: e.node.title,
-            handle: e.node.handle,
-            url: `https://${domainForLinks}.store/products/${e.node.handle}`,
-            productType: e.node.productType,
-            tags: e.node.tags,
-            desc: e.node.description || "",
-            image: e.node.featuredImage?.url || "",
-            available: v?.availableForSale ?? true,
+            title: n.title,
+            handle: n.handle,
+            url: n.onlineStoreUrl || `https://${domainForLinks}.store/products/${n.handle}`,
+            productType: n.productType,
+            tags: n.tags,
+            desc: n.description || "",
+            image: n.featuredImage?.url || "",
+            available: (v?.availableForSale ?? n.availableForSale) ?? true,
             qty: (typeof v?.quantityAvailable === "number") ? v.quantityAvailable : null,
             price: v?.price?.amount ? `${v.price.amount} ${v.price.currencyCode}` : null
           };
@@ -105,10 +109,10 @@ export default async function handler(req, res) {
     // ===== 2) GPT-Antwort mit Katalog-Kontext =====
     const systemPrompt = [
       "Du bist ein Produktberater für einen Shopify-Shop. Antworte kurz, klar und freundlich.",
-      "Nutze die bereitgestellten Produkte (JSON) strikt für Empfehlungen; erfinde nichts.",
-      "Wenn die Liste leer ist, stelle genau 1 Rückfrage zur Präzisierung.",
+      "Nutze NUR die bereitgestellten Produkte (JSON) für Empfehlungen; erfinde nichts.",
+      "Wenn die Liste leer ist, stelle genau 1 kurze Rückfrage zur Präzisierung.",
       "Gib je Empfehlung: Titel, 1 Satz Nutzen, Preis (falls vorhanden) und Link.",
-      "Kennzeichne Verfügbarkeit grob: 'Auf Lager' (qty>5 oder available), 'Begrenzt' (1–5), 'Nicht verfügbar' (0/false)."
+      "Verfügbarkeit: '✅ Auf Lager' (qty>5 oder available true), '⚠️ Begrenzt' (1–5), '❌ Nicht verfügbar' (0/false).",
     ].join(" ");
 
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -125,22 +129,22 @@ export default async function handler(req, res) {
         temperature: 0.4,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: `Nutzerfrage: ${message}\nKontext: ${JSON.stringify(context||{})}\nKatalog(JSON): ${catalogSnippet}` }
+          { role: "user", content: `Nutzerfrage: ${message}\nKontext: ${JSON.stringify(context || {})}\nKatalog(JSON): ${catalogSnippet}` }
         ]
       })
     });
 
     if (!openaiRes.ok) {
-      const errText = await openaiRes.text().catch(()=> "");
-      return res.status(openaiRes.status).json({ ok:false, error:"OpenAI error", details: errText });
+      const errText = await openaiRes.text().catch(() => "");
+      return res.status(openaiRes.status).json({ ok: false, error: "OpenAI error", details: errText });
     }
 
     const data = await openaiRes.json();
     const text = data?.choices?.[0]?.message?.content?.trim() || "Entschuldigung, keine Antwort erhalten.";
-    return res.status(200).json({ ok:true, text });
+    return res.status(200).json({ ok: true, text });
 
   } catch (e) {
     console.error("Proxy error", e);
-    return res.status(500).json({ ok:false, error:"Proxy error", details:String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "Proxy error", details: String(e?.message || e) });
   }
 }
